@@ -1,0 +1,7 @@
+.vscode/
+.localstack/
+.localstack-data/
+.venv/
+node_modules/
+*.log
+/tmp/

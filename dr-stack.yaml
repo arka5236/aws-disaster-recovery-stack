@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: DR stack for local testing (S3 buckets and Lambda)
+Resources:
+  DrBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: dr-bucket
+      VersioningConfiguration:
+        Status: Enabled
+  S3ReplicationRole:
+    Type: AWS::IAM::Role
+    DependsOn: DrBucket
+    Properties:
+      RoleName: s3-replication-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                Resource: 'arn:aws:s3:::primary-bucket'
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                Resource: 'arn:aws:s3:::primary-bucket/*'
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                Resource: 'arn:aws:s3:::dr-bucket/*'
+  PrimaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: primary-bucket
+      VersioningConfiguration:
+        Status: Enabled
+      ReplicationConfiguration:
+        Role:
+          Fn::GetAtt:
+            - S3ReplicationRole
+            - Arn
+        Rules:
+          - Id: ReplicateToDR
+            Status: Enabled
+            Priority: 1
+            Filter:
+              Prefix: ''
+            Destination:
+              Bucket:
+                Fn::GetAtt:
+                  - DrBucket
+                  - Arn
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-exec-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Route53Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetChange
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: example.local
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        ResourcePath: /health
+        FullyQualifiedDomainName: primary.example.local
+        Port: 443
+        RequestInterval: 30
+        FailureThreshold: 3
+  DNSRecordPrimary:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZone
+      Name: app.example.local
+      Type: A
+      SetIdentifier: Primary
+      Failover: PRIMARY
+      HealthCheckId:
+        Ref: PrimaryHealthCheck
+      TTL: 60
+      ResourceRecords:
+        - 192.0.2.1
+  DNSRecordDR:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZone
+      Name: app.example.local
+      Type: A
+      SetIdentifier: DR
+      Failover: SECONDARY
+      TTL: 60
+      ResourceRecords:
+        - 192.0.2.10
+  FailoverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: dr-failover
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Role:
+        Fn::GetAtt:
+          - LambdaExecutionRole
+          - Arn
+      Environment:
+        Variables:
+          PRIMARY_BUCKET: primary-bucket
+          DR_BUCKET: dr-bucket
+          HOSTED_ZONE_ID:
+            Ref: HostedZone
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log("DR failover invoked", event);
+            return { statusCode: 200, body: "ok" };
+          };
+  FailbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: dr-failback
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Role:
+        Fn::GetAtt:
+          - LambdaExecutionRole
+          - Arn
+      Environment:
+        Variables:
+          PRIMARY_BUCKET: primary-bucket
+          DR_BUCKET: dr-bucket
+          HOSTED_ZONE_ID:
+            Ref: HostedZone
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log("DR failback invoked", event);
+            return { statusCode: 200, body: "ok" };
+          };
+  HealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PrimaryHealthCheckAlarm
+      AlarmDescription: Trigger failover when primary is unhealthy
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: HealthCheckId
+          Value:
+            Ref: PrimaryHealthCheck

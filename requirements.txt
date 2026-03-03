@@ -1,0 +1,8 @@
+localstack
+awscli
+awscli-local
+boto3
+moto
+pytest
+python-dotenv
+aws-sam-cli
